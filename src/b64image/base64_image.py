@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import re
 from base64 import b64decode, b64encode
+from io import BytesIO
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Iterator,
     Literal,
     NamedTuple,
@@ -15,15 +17,14 @@ from typing import (
 )
 from urllib.parse import urlparse
 
+if TYPE_CHECKING:
+    from PIL.Image import Image as PILImage
+
 from .imghdr import TestableImageType, what
 
 ImageType: TypeAlias = Literal["jpeg", "png", "gif", "webp", "bmp"]
 ALLOWED_IMAGE_FORMATS: tuple[ImageType, ...] = get_args(ImageType)
-IMAGE_PATTERN = re.compile(
-    r"data:image/("
-    + "|".join(ALLOWED_IMAGE_FORMATS)
-    + r");base64,([A-Za-z0-9+/]+={0,2})"
-)
+IMAGE_PATTERN = re.compile(r"data:image/(" + "|".join(ALLOWED_IMAGE_FORMATS) + r");base64,([A-Za-z0-9+/]+={0,2})")
 
 
 class Base64Image(NamedTuple):
@@ -140,6 +141,72 @@ class Base64Image(NamedTuple):
         """Return the size of decoded image in bytes."""
         return len(self.to_bytes())
 
+    @property
+    def size_mb(self) -> float:
+        """Return the size of decoded image in megabytes."""
+        return self.size_bytes / (1024 * 1024)
+
+    @property
+    def dimensions(self) -> tuple[int, int]:
+        """Return (width, height) of the image. Requires Pillow."""
+        with _open_pil(self.to_bytes()) as im:
+            return im.size
+
+    @property
+    def width(self) -> int:
+        """Return the width of the image in pixels. Requires Pillow."""
+        return self.dimensions[0]
+
+    @property
+    def height(self) -> int:
+        """Return the height of the image in pixels. Requires Pillow."""
+        return self.dimensions[1]
+
+    def resize(self, width: int, height: int) -> Self:
+        """Resize the image to exact dimensions. Returns a new Base64Image.
+
+        Requires Pillow. Uses Lanczos resampling for high quality.
+
+        Args:
+            width: Target width in pixels.
+            height: Target height in pixels.
+
+        Returns:
+            A new Base64Image with the resized image data.
+        """
+        from PIL.Image import Resampling
+
+        with _open_pil(self.to_bytes()) as im:
+            resized = im.resize((width, height), Resampling.LANCZOS)  # pyright: ignore[reportUnknownMemberType]
+            return self.__class__(
+                ext=self.ext,
+                data=b64encode(_encode_pil(resized, self.ext)).decode("ascii"),
+            )
+
+
+# ===== PIL Helpers (optional dependency) =====
+
+
+def _open_pil(data: bytes) -> PILImage:
+    """Open image bytes with PIL. Raises ImportError if Pillow is not installed."""
+    try:
+        from PIL.Image import open as image_open
+    except ImportError:
+        raise ImportError(
+            "Pillow is required for image manipulation. Install it with: pip install b64image[pillow]"
+        ) from None
+    return image_open(BytesIO(data))
+
+
+def _encode_pil(im: PILImage, ext: str) -> bytes:
+    """Encode a PIL Image to bytes in the specified format."""
+    save_format = ext.upper()
+    if save_format == "JPG":
+        save_format = "JPEG"
+    buf = BytesIO()
+    im.save(buf, format=save_format)
+    return buf.getvalue()
+
 
 # ===== Batch Processing =====
 
@@ -214,7 +281,7 @@ def _is_remote_url(path: str) -> bool:
 def _guess_image_extension(ext: str) -> Optional[ImageType]:
     lowered: str = ext.lower().removeprefix(".")
     if lowered in ALLOWED_IMAGE_FORMATS:
-        return lowered  # type: ignore[return-value]
+        return lowered
     elif lowered == "jpg":
         return "jpeg"
     return None
